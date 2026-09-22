@@ -7,7 +7,7 @@ import os
 from fastapi import FastAPI, UploadFile, File, HTTPException
 from fastapi.responses import JSONResponse
 
-from mcp.server.fastmcp import FastMCP
+from mcp.server import MCPServer
 from mcp.server.transport_security import TransportSecuritySettings
 
 from analyzer import analyze_audio
@@ -17,22 +17,7 @@ from analyzer import analyze_audio
 # MCP SERVER
 # ---------------------------------------------------------
 
-mcp = FastMCP(
-    "Black Red Line AUDIO ANALYZER",
-    stateless_http=True,
-    json_response=True,
-    transport_security=TransportSecuritySettings(
-        enable_dns_rebinding_protection=True,
-        allowed_hosts=[
-            "black-red-line-audio-analyzer.onrender.com",
-            "black-red-line-audio-analyzer.onrender.com:*",
-            "localhost",
-            "localhost:*",
-            "127.0.0.1",
-            "127.0.0.1:*",
-        ],
-    ),
-)
+mcp = MCPServer("Black Red Line AUDIO ANALYZER")
 
 
 @mcp.tool()
@@ -45,8 +30,20 @@ def analyzer_status() -> dict:
     }
 
 
-# MCP Streamable HTTP application
-mcp_app = mcp.streamable_http_app()
+# Разрешаем публичный домен Render.
+security = TransportSecuritySettings(
+    allowed_hosts=[
+        "black-red-line-audio-analyzer.onrender.com",
+        "black-red-line-audio-analyzer.onrender.com:*",
+    ],
+)
+
+
+# ВАЖНО: сначала создаём MCP-приложение.
+mcp_app = mcp.streamable_http_app(
+    streamable_http_path="/",
+    transport_security=security,
+)
 
 
 # ---------------------------------------------------------
