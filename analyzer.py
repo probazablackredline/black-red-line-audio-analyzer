@@ -1,19 +1,20 @@
 from __future__ import annotations
 
+import argparse
 import json
-import math
-from dataclasses import dataclass, asdict
+from dataclasses import asdict, dataclass
 from pathlib import Path
-from typing import List, Optional
+from typing import Any
 
+import essentia.standard as es
 import numpy as np
 
-try:
-    import essentia.standard as es
-except ImportError as e:
-    raise SystemExit(
-        "Essentia is not installed. Install dependencies from requirements.txt."
-    ) from e
+SCHEMA_VERSION = "1.1"
+SAMPLE_RATE = 44100
+FRAME_SIZE = 2048
+HOP_SIZE = 512
+BASS_MIN_HZ = 25.0
+BASS_MAX_HZ = 160.0
 
 
 @dataclass
@@ -23,6 +24,7 @@ class Event:
     strength: float
     confidence: float
 
+
 @dataclass
 class AnalysisResult:
     schema_version: str
@@ -30,156 +32,259 @@ class AnalysisResult:
     duration_sec: float
     bpm: float
     bpm_confidence: float
-    beats: List[float]
-    events: List[Event]
-    sync_points: List[Event]
+    beats: list[float]
+    events: list[dict[str, Any]]
+    sync_points: list[dict[str, Any]]
 
 
-def _robust_z(x: np.ndarray) -> np.ndarray:
-    if x.size == 0:
-        return x
-    med = np.median(x)
-    mad = np.median(np.abs(x - med))
+def robust_zscore(values: np.ndarray) -> np.ndarray:
+    values = np.asarray(values, dtype=np.float64)
+    if values.size == 0:
+        return values
+    median = np.median(values)
+    mad = np.median(np.abs(values - median))
     scale = 1.4826 * mad
     if scale < 1e-9:
-        std = np.std(x)
+        std = np.std(values)
         scale = std if std > 1e-9 else 1.0
-    return (x - med) / scale
+    return (values - median) / scale
 
 
-def _merge_events(events: List[Event], tolerance: float = 0.09) -> List[Event]:
+def _normalize_strength(value: float) -> float:
+    return float(max(0.0, value))
+
+
+def _merge_nearby(events: list[Event], window_sec: float = 0.32) -> list[Event]:
+    """Merge detections that describe the same musical moment."""
     if not events:
         return []
-    events = sorted(events, key=lambda e: e.time)
-    merged: List[Event] = [events[0]]
-    priority = {"DROP": 5, "BASS_PEAK": 4, "STRONG_BEAT": 3, "TRANSITION": 2, "BEAT": 1}
-    for e in events[1:]:
-        prev = merged[-1]
-        if abs(e.time - prev.time) <= tolerance:
-            if (priority.get(e.type, 0), e.strength) > (priority.get(prev.type, 0), prev.strength):
-                merged[-1] = e
+
+    priority = {
+        "DROP": 4,
+        "TRANSITION": 3,
+        "BASS_PEAK": 2,
+        "STRONG_BEAT": 1,
+        "BEAT": 0,
+    }
+
+    ordered = sorted(events, key=lambda e: e.time)
+    groups: list[list[Event]] = [[ordered[0]]]
+
+    for event in ordered[1:]:
+        if event.time - groups[-1][-1].time <= window_sec:
+            groups[-1].append(event)
         else:
-            merged.append(e)
+            groups.append([event])
+
+    merged: list[Event] = []
+    for group in groups:
+        best = max(
+            group,
+            key=lambda e: (e.strength + priority.get(e.type, 0) * 0.35, priority.get(e.type, 0)),
+        )
+        combined_strength = max(e.strength for e in group)
+        combined_confidence = max(e.confidence for e in group)
+        merged.append(
+            Event(
+                time=best.time,
+                type=best.type,
+                strength=round(combined_strength, 4),
+                confidence=round(combined_confidence, 4),
+            )
+        )
     return merged
 
 
-def analyze_audio(path: str, max_sync_points: int = 24) -> AnalysisResult:
-    audio_path = Path(path)
-    if not audio_path.exists():
-        raise FileNotFoundError(audio_path)
+def _suppress_close_drops(events: list[Event], min_gap_sec: float = 2.5) -> list[Event]:
+    """Keep only the strongest DROP inside a short musical window."""
+    drops = [e for e in events if e.type == "DROP"]
+    others = [e for e in events if e.type != "DROP"]
 
-    loader = es.MonoLoader(filename=str(audio_path), sampleRate=44100)
-    audio = loader()
-    sr = 44100
-    duration = len(audio) / sr
+    kept: list[Event] = []
+    for event in sorted(drops, key=lambda e: e.strength, reverse=True):
+        if all(abs(event.time - k.time) >= min_gap_sec for k in kept):
+            kept.append(event)
+
+    return sorted(others + kept, key=lambda e: e.time)
+
+
+def _balanced_sync_points(events: list[Event], max_points: int) -> list[dict[str, Any]]:
+    """
+    Build a montage-oriented shortlist instead of simply taking the loudest events.
+    Major changes are preferred, but bass hits and strong beats are deliberately retained.
+    """
+    if max_points <= 0:
+        return []
+
+    quotas = {
+        "DROP": max(1, round(max_points * 0.35)),
+        "TRANSITION": max(1, round(max_points * 0.25)),
+        "BASS_PEAK": max(1, round(max_points * 0.25)),
+        "STRONG_BEAT": max(1, round(max_points * 0.15)),
+    }
+
+    selected: list[Event] = []
+    min_spacing = 0.75
+
+    def can_add(candidate: Event) -> bool:
+        return all(abs(candidate.time - s.time) >= min_spacing for s in selected)
+
+    for kind in ("DROP", "TRANSITION", "BASS_PEAK", "STRONG_BEAT"):
+        candidates = sorted(
+            (e for e in events if e.type == kind),
+            key=lambda e: (e.strength, e.confidence),
+            reverse=True,
+        )
+        count = 0
+        for event in candidates:
+            if count >= quotas[kind]:
+                break
+            if can_add(event):
+                selected.append(event)
+                count += 1
+
+    if len(selected) < max_points:
+        leftovers = sorted(
+            (e for e in events if e.type != "BEAT" and e not in selected),
+            key=lambda e: (e.strength, e.confidence),
+            reverse=True,
+        )
+        for event in leftovers:
+            if len(selected) >= max_points:
+                break
+            if can_add(event):
+                selected.append(event)
+
+    selected = sorted(selected[:max_points], key=lambda e: e.time)
+    return [
+        {
+            "time": round(e.time, 4),
+            "type": e.type,
+            "strength": round(e.strength, 4),
+            "confidence": round(e.confidence, 4),
+        }
+        for e in selected
+    ]
+
+
+def analyze_audio(path: str | Path, max_sync_points: int = 24) -> AnalysisResult:
+    path = Path(path)
+
+    audio = es.MonoLoader(filename=str(path), sampleRate=SAMPLE_RATE)()
+    duration_sec = len(audio) / SAMPLE_RATE
 
     rhythm = es.RhythmExtractor2013(method="multifeature")
     bpm, ticks, confidence, _, _ = rhythm(audio)
-    ticks = np.asarray(ticks, dtype=float)
+    beats = [round(float(t), 4) for t in ticks]
 
-    # Frame-level spectral analysis.
-    frame_size, hop = 2048, 512
     window = es.Windowing(type="hann")
-    spectrum = es.Spectrum()
-    freqs = np.fft.rfftfreq(frame_size, 1.0 / sr)
+    spectrum = es.Spectrum(size=FRAME_SIZE)
 
-    bass_mask = (freqs >= 25) & (freqs <= 160)
-    lowmid_mask = (freqs > 160) & (freqs <= 500)
+    freqs = np.fft.rfftfreq(FRAME_SIZE, d=1.0 / SAMPLE_RATE)
+    bass_mask = (freqs >= BASS_MIN_HZ) & (freqs <= BASS_MAX_HZ)
 
-    times, bass_energy, total_energy, flux = [], [], [], []
-    prev_mag = None
-    for i, frame in enumerate(es.FrameGenerator(audio, frameSize=frame_size, hopSize=hop, startFromZero=True)):
-        mag = np.asarray(spectrum(window(frame)), dtype=float)
-        power = mag * mag
-        times.append((i * hop + frame_size / 2) / sr)
-        bass_energy.append(float(power[bass_mask].sum()))
-        total_energy.append(float(power.sum()))
-        if prev_mag is None:
-            flux.append(0.0)
+    bass_energy = []
+    spectral_flux = []
+    prev_spec = None
+
+    for frame in es.FrameGenerator(
+        audio,
+        frameSize=FRAME_SIZE,
+        hopSize=HOP_SIZE,
+        startFromZero=True,
+    ):
+        spec = np.asarray(spectrum(window(frame)), dtype=np.float64)
+        bass_energy.append(float(np.sum(spec[bass_mask] ** 2)))
+
+        if prev_spec is None:
+            spectral_flux.append(0.0)
         else:
-            d = np.maximum(mag - prev_mag, 0.0)
-            flux.append(float(np.dot(d, d)))
-        prev_mag = mag
+            diff = np.maximum(spec - prev_spec, 0.0)
+            spectral_flux.append(float(np.sum(diff)))
+        prev_spec = spec
 
-    times = np.asarray(times)
-    bass_z = _robust_z(np.log1p(np.asarray(bass_energy)))
-    energy_z = _robust_z(np.log1p(np.asarray(total_energy)))
-    flux_z = _robust_z(np.log1p(np.asarray(flux)))
+    bass_z = robust_zscore(np.asarray(bass_energy))
+    flux_z = robust_zscore(np.asarray(spectral_flux))
+    frame_times = np.arange(len(bass_z)) * HOP_SIZE / SAMPLE_RATE
 
-    events: List[Event] = []
+    raw_events: list[Event] = []
 
-    # Every beat is retained; strength is estimated from nearby frame energy/flux.
-    for t in ticks:
-        idx = int(np.argmin(np.abs(times - t))) if times.size else 0
-        s = float(max(0.0, 0.55 * energy_z[idx] + 0.45 * flux_z[idx])) if times.size else 0.0
-        events.append(Event(float(t), "BEAT", round(s, 4), round(float(confidence), 4)))
+    # Beat layer: useful for micro-sync, but not every beat is a major edit point.
+    beat_interval = 60.0 / float(bpm) if bpm > 0 else 0.5
+    for i, beat in enumerate(beats):
+        raw_events.append(Event(beat, "BEAT", 1.0, min(1.0, float(confidence))))
+        if i % 4 == 0:
+            raw_events.append(Event(beat, "STRONG_BEAT", 2.0, min(1.0, float(confidence))))
 
-    # Strong beats: top local beat accents.
-    if len(ticks):
-        beat_scores = []
-        for t in ticks:
-            idx = int(np.argmin(np.abs(times - t)))
-            score = 0.45 * energy_z[idx] + 0.35 * flux_z[idx] + 0.20 * bass_z[idx]
-            beat_scores.append(score)
-        beat_scores = np.asarray(beat_scores)
-        threshold = max(1.0, float(np.percentile(beat_scores, 75)))
-        for t, score in zip(ticks, beat_scores):
-            if score >= threshold:
-                conf = min(1.0, 0.55 + max(0.0, score) / 6.0)
-                events.append(Event(float(t), "STRONG_BEAT", round(float(score), 4), round(conf, 4)))
+    # Bass peaks: require a clear local maximum and a meaningful robust z-score.
+    for i in range(1, len(bass_z) - 1):
+        if bass_z[i] >= 3.0 and bass_z[i] >= bass_z[i - 1] and bass_z[i] > bass_z[i + 1]:
+            raw_events.append(
+                Event(float(frame_times[i]), "BASS_PEAK", _normalize_strength(float(bass_z[i])), 0.85)
+            )
 
-    # Bass peaks: local maxima in robust low-frequency energy.
-    for i in range(1, max(1, len(times) - 1)):
-        if bass_z[i] > 1.8 and bass_z[i] >= bass_z[i-1] and bass_z[i] > bass_z[i+1]:
-            events.append(Event(float(times[i]), "BASS_PEAK", round(float(bass_z[i]), 4),
-                                round(min(1.0, 0.55 + bass_z[i] / 8.0), 4)))
+    # Transitions: spectral change, stricter than v1.0.
+    for i in range(1, len(flux_z) - 1):
+        if flux_z[i] >= 4.0 and flux_z[i] >= flux_z[i - 1] and flux_z[i] > flux_z[i + 1]:
+            raw_events.append(
+                Event(float(frame_times[i]), "TRANSITION", _normalize_strength(float(flux_z[i])), 0.82)
+            )
 
-    # Transitions / drops: spectral-flux + energy discontinuities.
-    # "DROP" is a heuristic candidate, not a semantic guarantee.
-    for i in range(2, max(2, len(times) - 2)):
-        transition_score = 0.60 * flux_z[i] + 0.40 * abs(energy_z[i] - energy_z[i-2])
-        if transition_score > 2.4:
-            typ = "DROP" if energy_z[i] > energy_z[i-2] and bass_z[i] > 0.8 else "TRANSITION"
-            conf = min(0.95, 0.50 + max(0.0, transition_score) / 10.0)
-            events.append(Event(float(times[i]), typ, round(float(transition_score), 4), round(conf, 4)))
+    # DROP heuristic v1.1:
+    # require BOTH strong spectral change and strong low-frequency energy.
+    # This prevents ordinary peaks from being labelled as drops.
+    for i in range(1, min(len(bass_z), len(flux_z)) - 1):
+        if (
+            flux_z[i] >= 4.5
+            and bass_z[i] >= 3.0
+            and flux_z[i] >= flux_z[i - 1]
+            and flux_z[i] > flux_z[i + 1]
+        ):
+            score = float(0.6 * flux_z[i] + 0.4 * bass_z[i])
+            raw_events.append(Event(float(frame_times[i]), "DROP", _normalize_strength(score), 0.88))
 
-    events = _merge_events(events)
+    # Collapse detections representing the same musical moment.
+    major = [e for e in raw_events if e.type != "BEAT"]
+    beats_only = [e for e in raw_events if e.type == "BEAT"]
+    major = _merge_nearby(major, window_sec=max(0.24, min(0.38, beat_interval * 0.8)))
+    major = _suppress_close_drops(major, min_gap_sec=max(2.0, beat_interval * 4.0))
 
-    # DIRECTOR-oriented shortlist. Favor meaningful high-strength events and spacing.
-    candidates = [e for e in events if e.type != "BEAT"]
-    candidates.sort(key=lambda e: (e.confidence * max(e.strength, 0.1)), reverse=True)
-    selected: List[Event] = []
-    for e in candidates:
-        if all(abs(e.time - s.time) >= 0.35 for s in selected):
-            selected.append(e)
-        if len(selected) >= max_sync_points:
-            break
-    selected.sort(key=lambda e: e.time)
+    events = sorted(beats_only + major, key=lambda e: e.time)
+    sync_points = _balanced_sync_points(major, max_sync_points=max_sync_points)
 
     return AnalysisResult(
-        schema_version="1.0",
-        source_file=audio_path.name,
-        duration_sec=round(float(duration), 3),
-        bpm=round(float(bpm), 3),
+        schema_version=SCHEMA_VERSION,
+        source_file=path.name,
+        duration_sec=round(float(duration_sec), 4),
+        bpm=round(float(bpm), 4),
         bpm_confidence=round(float(confidence), 4),
-        beats=[round(float(x), 4) for x in ticks],
-        events=events,
-        sync_points=selected,
+        beats=beats,
+        events=[
+            {
+                "time": round(e.time, 4),
+                "type": e.type,
+                "strength": round(e.strength, 4),
+                "confidence": round(e.confidence, 4),
+            }
+            for e in events
+        ],
+        sync_points=sync_points,
     )
 
 
-def main():
-    import argparse
-    parser = argparse.ArgumentParser(description="Black Red Line AUDIO ANALYZER 1.0")
-    parser.add_argument("audio", help="Path to MP3/WAV/AAC supported by Essentia/FFmpeg build")
-    parser.add_argument("-o", "--output", default="analysis.json")
+def main() -> None:
+    parser = argparse.ArgumentParser(description="Black Red Line Audio Analyzer 1.1")
+    parser.add_argument("audio", help="Path to an audio file")
+    parser.add_argument("-o", "--output", default="analysis.json", help="Output JSON file")
     parser.add_argument("--max-sync-points", type=int, default=24)
     args = parser.parse_args()
 
-    result = analyze_audio(args.audio, args.max_sync_points)
-    payload = asdict(result)
-    Path(args.output).write_text(json.dumps(payload, ensure_ascii=False, indent=2), encoding="utf-8")
-    print(json.dumps(payload, ensure_ascii=False, indent=2))
+    result = analyze_audio(args.audio, max_sync_points=args.max_sync_points)
+    Path(args.output).write_text(
+        json.dumps(asdict(result), ensure_ascii=False, indent=2),
+        encoding="utf-8",
+    )
+    print(args.output)
 
 
 if __name__ == "__main__":
