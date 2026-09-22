@@ -6,9 +6,9 @@ import os
 
 from fastapi import FastAPI, UploadFile, File, HTTPException
 from fastapi.responses import JSONResponse
-from starlette.routing import Mount
 
-from mcp.server.mcpserver import MCPServer
+from mcp.server.fastmcp import FastMCP
+from mcp.server.transport_security import TransportSecuritySettings
 
 from analyzer import analyze_audio
 
@@ -17,12 +17,27 @@ from analyzer import analyze_audio
 # MCP SERVER
 # ---------------------------------------------------------
 
-mcp = MCPServer("Black Red Line AUDIO ANALYZER")
+mcp = FastMCP(
+    "Black Red Line AUDIO ANALYZER",
+    stateless_http=True,
+    json_response=True,
+    transport_security=TransportSecuritySettings(
+        enable_dns_rebinding_protection=True,
+        allowed_hosts=[
+            "black-red-line-audio-analyzer.onrender.com",
+            "black-red-line-audio-analyzer.onrender.com:*",
+            "localhost",
+            "localhost:*",
+            "127.0.0.1",
+            "127.0.0.1:*",
+        ],
+    ),
+)
 
 
 @mcp.tool()
 def analyzer_status() -> dict:
-    """Check whether the Black Red Line AUDIO ANALYZER MCP tool is available."""
+    """Check whether the Black Red Line AUDIO ANALYZER is available."""
     return {
         "status": "ok",
         "service": "black-red-line-audio-analyzer",
@@ -30,12 +45,8 @@ def analyzer_status() -> dict:
     }
 
 
-# MCP ASGI application.
-# streamable_http_path="/" means the public endpoint is /mcp/
-mcp_app = mcp.streamable_http_app(
-    streamable_http_path="/",
-    json_response=True,
-)
+# MCP Streamable HTTP application
+mcp_app = mcp.streamable_http_app()
 
 
 # ---------------------------------------------------------
