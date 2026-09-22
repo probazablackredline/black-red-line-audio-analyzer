@@ -1,0 +1,23 @@
+{
+  "tool_name": "audio_analyzer",
+  "version": "1.0",
+  "purpose": "Analyze a music track and return timing landmarks for Black Red Line video editing.",
+  "input": {
+    "file": "audio binary: mp3/wav/aac where decoder support is available",
+    "max_sync_points": 24
+  },
+  "output_fields": {
+    "bpm": "estimated tempo",
+    "bpm_confidence": "Essentia rhythm confidence",
+    "beats": "beat timestamps in seconds",
+    "events": "all detected musical events",
+    "sync_points": "shortlist for DIRECTOR"
+  },
+  "director_rules": [
+    "Video movement and exercise readability have priority over beat matching.",
+    "Never cut a repetition at a mechanically confusing point only to hit a beat.",
+    "Prefer DROP/BASS_PEAK/STRONG_BEAT for major cuts or movement starts.",
+    "Treat DROP and TRANSITION as heuristic candidates, not guaranteed musical semantics.",
+    "Use only factual weight/reps/sets supplied by the user or verified from project data."
+  ]
+}

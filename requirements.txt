@@ -1,0 +1,5 @@
+essentia>=2.1b6.dev1110
+numpy>=1.24
+fastapi>=0.110
+uvicorn[standard]>=0.27
+python-multipart>=0.0.9
